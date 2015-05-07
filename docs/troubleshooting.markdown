@@ -6,9 +6,26 @@ category: Troubleshooting
 permalink: docs/troubleshooting.html
 ---
 
-If you've been directed to this page due to an error or warning output from
-Watchman, it typically means that there is some system tuning that you need to
-perform.
+We try to give directed advice in Watchman error diagnostics, which means that
+we will show a link to a section on this page with some context and advice where
+we have enough information to do so.  Some operating systems provide richer
+diagnostic information than others, so we have to resort to more generic
+advice in some cases.
+
+The most common cause of problems is hitting system resource limits.  There are
+finite resources available for filesystem watching, and when they are exceeded
+it can impact performance in the best case or prohibit correct operation in the
+worst case.
+
+## Ensure that you are on the best available version
+
+It is generally a good idea to make sure that you are using the latest
+version of the software, so that you avoid any known issues.
+
+If you are running a pre-built binary provided by your operating system
+distribution system, there is a chance that you'll need to build the
+latest version from source.  You can find instructions for this in
+[the installation section](/watchman/docs/install.html).
 
 ## Recrawl
 
@@ -37,6 +54,9 @@ system administrator should review the workload for your system and the
 [System Specific Preparation Documentation](
 /watchman/docs/install.html#system-specific-preparation) and raise your limits
 accordingly.
+
+OS X has a similar internal limit and behavior when that limit is exceeded.
+Unfortunately this limit is not tunable on OS X.
 
 ### I've changed my limits, how can I clear the warning?
 
@@ -99,3 +119,84 @@ resolution is to run `watchman shutdown-server`.
 
 If you have not actually resolved the root cause you may continue to trigger
 and experience this state each time the system trips over these limits.
+
+## FSEvents
+
+FSEvents is the file watching facility on OS X.  There are few diagnostics
+that can help diagnose issues with FSEvents; the API itself gives little
+feedback on a number of error cases and instead emits rather cryptic error
+messages to the log file.
+
+If you got here because an error message told you to read this section,
+it will have also asked you to look at your log file.  If you are using an
+older version of watchman and encounter the error message
+`FSEventStreamStart failed`, then you should locate your log file (see
+[Where are the logs?](#where-are-the-logs) above) and look for lines
+that mention FSEvents and then consult the information below.
+
+### FSEventStreamStart: register_with_server: ERROR: f2d_register_rpc() => (null) (-21)
+
+Nobody outside of Apple is sure what precisely this means, but it indicates
+that the fsevents service has gotten in a bad state.  Possible reasons for
+this may include:
+
+* There are too many event stream clients
+* One or more event stream clients has gotten in a bad state and is somehow
+  impacting the fsevents service
+
+To resolve this issue, you may wish to try the following, which are
+progressively more invasive:
+
+* Avoid establishing multiple overlapping watches within the same filesystem
+  tree, especially for large trees.  We recommend watching only the root of a
+  project or repo and not watching sub-trees within that tree.  Organizations
+  with large trees may wish to deploy the
+  [root_restrict_files](config.html#root-restrict-files) configuration option
+  so that watchman will only allow watching project roots.
+* Close or restart other applications that are using fsevents.
+  Some examples are:
+ * editors such as Sublime Text and TextMate.
+ * Many nodejs packages and Grunt style workflows make use of fsevents.
+   Make sure that you upgrade nodejs to at least version `v0.11.14`.  If
+   possible, configure your nodejs packages to use either
+   [sane](https://www.npmjs.com/package/sane) or
+   [fb-watchman](https://www.npmjs.com/package/fb-watchman) for file watching
+   as this will consolidate the number of fsevents watches down to just the
+   set maintained by watchman.
+* Restart the fsevents service: `sudo pkill -9 -x fseventsd`
+* Restart your computer
+
+## Triggers/Subscriptions don't fire on OS X
+
+There is a rare fsevents bug that can prevent any notifications from working
+in directories where the case of the name of a directory in the kernel has
+an inconsistency.
+
+You can test whether this is happening to you by following [the instructions
+for the find-fsevents-bugs tool](
+https://github.com/andreyvit/find-fsevents-bugs).
+
+If it is happening to you, the resolution is to rename the directories
+highlighted by the tool.
+
+You can read more about this issue in the following resources:
+
+* [Knowledge base article for LiveReload](
+http://feedback.livereload.com/knowledgebase/articles/86239-os-x-fsevents-bug-may-prevent-monitoring-of-certai)
+* [issue for the Ruby fsevents module](https://github.com/thibaudgg/rb-fsevent/issues/10)
+* [Open Radar bug report](http://openradar.appspot.com/10207999)
+
+## ReactNative: Watcher took too long to load
+
+There was an issue that was the result of umask affecting the permissions of
+the launchd plist file that Watchman uses to set up your watchman service on OS X.
+This issue was resolved in Watchman version 3.1.
+
+To update:
+
+```
+watchman shutdown-server
+brew update
+brew reinstall watchman
+```
+

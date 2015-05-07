@@ -8,7 +8,7 @@ docdir = ${prefix}/share/doc/watchman-$(VERSION)
 THIRDPARTY_CPPFLAGS = -I$(top_srcdir)/thirdparty/jansson -I$(top_builddir)/thirdparty/jansson
 JSON_LIB = -L. libwmanjson.a
 
-watchman_CPPFLAGS = $(THIRDPARTY_CPPFLAGS) @IRONMANCFLAGS@
+watchman_CPPFLAGS = $(THIRDPARTY_CPPFLAGS) @IRONMANCFLAGS@ -DWATCHMAN_STATE_DIR='"@WATCHMAN_STATE_DIR@"'
 watchman_LDADD = $(JSON_LIB)
 watchman_SOURCES = \
 	argv.c       \
@@ -33,8 +33,10 @@ watchman_SOURCES = \
 	cmds/watch.c    \
 	cmds/debug.c    \
 	query/base.c       \
+	query/dirname.c    \
 	query/parse.c      \
 	query/eval.c       \
+	query/intcompare.c \
 	query/type.c       \
 	query/suffix.c     \
 	query/match.c      \
@@ -136,6 +138,8 @@ endif
 all-local: py-build rb-build lint
 
 install-exec-local: py-install
+	${INSTALL} -d -m 777 ${DESTDIR}${WATCHMAN_STATE_DIR}
+	touch ${DESTDIR}${WATCHMAN_STATE_DIR}/.not-empty
 
 clean-local: py-clean rb-clean
 	-find python \( -name '*.py[cdo]' -o -name '*.so' \) -exec rm -f '{}' ';'

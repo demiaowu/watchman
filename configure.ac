@@ -1,4 +1,4 @@
-AC_INIT([watchman], [3.0.0], [], [watchman])
+AC_INIT([watchman], [3.1.1], [], [watchman])
 AC_CANONICAL_TARGET
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES(yes)])
@@ -55,13 +55,15 @@ AC_ARG_WITH(buildinfo, [
  AC_DEFINE_UNQUOTED(WATCHMAN_BUILD_INFO, "$withval", [build info])
 ])
 
+
+WATCHMAN_STATE_DIR="\$(prefix)/var/run/watchman"
 AC_ARG_ENABLE(statedir, [
   --enable-statedir=PATH  Use PATH as the default for state, log files
                           and sockets instead of using your system tempdir
 ],[
- AC_DEFINE_UNQUOTED(WATCHMAN_STATE_DIR, "$enableval",
-                    [default location for state])
+ WATCHMAN_STATE_DIR="$enableval"
 ])
+AC_SUBST(WATCHMAN_STATE_DIR)
 
 want_python=no
 AC_ARG_WITH(python, [

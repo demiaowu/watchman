@@ -11,7 +11,7 @@ static enum w_pdu_type output_pdu = is_json_pretty;
 static char *server_encoding = NULL;
 static char *output_encoding = NULL;
 static char *sock_name = NULL;
-static char *log_name = NULL;
+char *log_name = NULL;
 #ifdef USE_GIMLI
 static char *pid_file = NULL;
 #endif
@@ -185,6 +185,27 @@ static void spawn_via_launchd(void)
   snprintf(plist_path, sizeof(plist_path),
       "%s/Library/LaunchAgents/com.github.facebook.watchman.plist", pw->pw_dir);
 
+  if (access(plist_path, R_OK) == 0) {
+    // Unload any that may already exist, as it is likely wrong
+    char *unload_argv[MAX_DAEMON_ARGS] = {
+      "/bin/launchctl",
+      "unload",
+      NULL
+    };
+    append_argv(unload_argv, plist_path);
+
+    errno = posix_spawnattr_init(&attr);
+    if (errno != 0) {
+      w_log(W_LOG_FATAL, "posix_spawnattr_init: %s\n", strerror(errno));
+    }
+
+    res = posix_spawnp(&pid, unload_argv[0], NULL, &attr, unload_argv, environ);
+    if (res == 0) {
+      waitpid(pid, &res, 0);
+    }
+    posix_spawnattr_destroy(&attr);
+  }
+
   fp = fopen(plist_path, "w");
   if (!fp) {
     w_log(W_LOG_ERR, "Failed to open %s for write: %s\n",
@@ -225,10 +246,18 @@ static void spawn_via_launchd(void)
 "    </dict>\n"
 "    <key>RunAtLoad</key>\n"
 "    <false/>\n"
+"    <key>EnvironmentVariables</key>\n"
+"    <dict>\n"
+"        <key>PATH</key>\n"
+"        <string><![CDATA[%s]]></string>\n"
+"    </dict>\n"
 "</dict>\n"
 "</plist>\n",
-    watchman_path, log_name, sock_name, watchman_state_file, sock_name);
+    watchman_path, log_name, sock_name, watchman_state_file, sock_name,
+    getenv("PATH"));
   fclose(fp);
+  // Don't rely on umask, ensure we have the correct perms
+  chmod(plist_path, 0644);
 
   append_argv(argv, plist_path);
 
@@ -597,7 +626,7 @@ int main(int argc, char **argv)
   }
 
   if (!no_spawn) {
-    w_log(W_LOG_ERR, "unable to talk to your watchman!\n");
+    w_log(W_LOG_ERR, "unable to talk to your watchman on %s!\n", sock_name);
   }
   return 1;
 }

@@ -53,15 +53,22 @@ static void delete_dir(w_ht_val_t val)
 {
   struct watchman_dir *dir = w_ht_val_ptr(val);
 
+  w_log(W_LOG_DBG, "delete_dir(%.*s)\n", dir->path->len, dir->path->buf);
+
   w_string_delref(dir->path);
+  dir->path = NULL;
+
   if (dir->files) {
     w_ht_free(dir->files);
+    dir->files = NULL;
   }
   if (dir->lc_files) {
     w_ht_free(dir->lc_files);
+    dir->lc_files = NULL;
   }
   if (dir->dirs) {
     w_ht_free(dir->dirs);
+    dir->dirs = NULL;
   }
   free(dir);
 }
@@ -703,6 +710,15 @@ static bool did_file_change(struct stat *saved, struct stat *fresh)
   return false;
 }
 
+// POSIX says open with O_NOFOLLOW should set errno to ELOOP if the path is a
+// symlink. However, FreeBSD (which ironically originated O_NOFOLLOW) sets it to
+// EMLINK.
+#ifdef __FreeBSD__
+#define ENOFOLLOWSYMLINK EMLINK
+#else
+#define ENOFOLLOWSYMLINK ELOOP
+#endif
+
 #ifdef __APPLE__
 static w_string_t *w_resolve_filesystem_canonical_name(const char *path)
 {
@@ -720,12 +736,9 @@ static w_string_t *w_resolve_filesystem_canonical_name(const char *path)
 
   if (getattrlist(path, &attrlist, &vomit,
         sizeof(vomit), FSOPT_NOFOLLOW) == -1) {
-    if (errno == ENOENT || errno == ENOTDIR) {
-      return w_string_new(path);
-    }
-
-    w_log(W_LOG_FATAL, "getattrlist(CMN_NAME: %s): fail %s\n",
-        path, strerror(errno));
+    // signal to caller that the file has disappeared -- the caller will read
+    // errno and do error handling
+    return NULL;
   }
 
   name = ((char*)&vomit.ref) + vomit.ref.attr_dataoffset;
@@ -805,6 +818,28 @@ static void stat_path(w_root_t *root,
       struct watchman_file *lc_file = NULL;
 
       canon_name = w_resolve_filesystem_canonical_name(path);
+
+      if (canon_name == NULL) {
+        // TOCTOU race: file disappeared (deleted? ran out of memory?) in
+        // between the lstat above and w_resolve_filesystem_canonical_name. Now
+        // that it's deleted, update our state to reflect that.
+        if (errno == ENOENT || errno == ENOTDIR || errno == ENOFOLLOWSYMLINK) {
+          if (dir_ent) {
+            handle_open_errno(root, dir_ent, now, "getattrlist", errno, NULL);
+          }
+          if (file) {
+            w_log(W_LOG_DBG, "getattrlist(%s) -> %s so marking %.*s deleted\n",
+                  path, strerror(err), file->name->len, file->name->buf);
+            file->exists = false;
+            w_root_mark_file_changed(root, file, now);
+          }
+
+          goto out;
+        }
+
+        w_log(W_LOG_FATAL, "getattrlist(CMN_NAME: %s): fail %s\n",
+              path, strerror(errno));
+      }
 
       if (!w_string_equal(file_name, canon_name)) {
         // Revise `path` to use the canonical name
@@ -948,6 +983,11 @@ static void stat_path(w_root_t *root,
     }
   }
 
+  // out is only used on some platforms, so on others compilers will complain
+  // about it being unused
+  goto out;
+
+out:
   w_string_delref(dir_name);
   w_string_delref(file_name);
 }
@@ -1043,40 +1083,34 @@ DIR *opendir_nofollow(const char *path)
 #endif
 }
 
-// POSIX says open with O_NOFOLLOW should set errno to ELOOP if the path is a
-// symlink. However, FreeBSD (which ironically originated O_NOFOLLOW) sets it to
-// EMLINK.
-#ifdef __FreeBSD__
-#define ENOFOLLOWSYMLINK EMLINK
-#else
-#define ENOFOLLOWSYMLINK ELOOP
-#endif
-
 void handle_open_errno(w_root_t *root, struct watchman_dir *dir,
-    struct timeval now, const char *syscall, int err)
+    struct timeval now, const char *syscall, int err, const char *reason)
 {
   w_string_t *dir_name = dir->path;
   if (err == ENOENT || err == ENOTDIR || err == ENOFOLLOWSYMLINK) {
     if (w_string_equal(dir_name, root->root_path)) {
       w_log(W_LOG_ERR,
             "%s(%.*s) -> %s. Root was deleted; cancelling watch\n",
-            syscall, dir_name->len, dir_name->buf, strerror(err));
+            syscall, dir_name->len, dir_name->buf,
+            reason ? reason : strerror(err));
       w_root_cancel(root);
       return;
     }
 
     w_log(W_LOG_DBG, "%s(%.*s) -> %s so invalidating descriptors\n",
-          syscall, dir_name->len, dir_name->buf, strerror(err));
+          syscall, dir_name->len, dir_name->buf,
+          reason ? reason : strerror(err));
     stop_watching_dir(root, dir);
     w_root_mark_deleted(root, dir, now, true);
     return;
   }
   w_log(W_LOG_ERR, "%s(%.*s) -> %s. We don't know how to handle this.",
-        syscall, dir_name->len, dir_name->buf, strerror(err));
+        syscall, dir_name->len, dir_name->buf,
+        reason ? reason : strerror(err));
 }
 
 void set_poison_state(w_root_t *root, struct watchman_dir *dir,
-    struct timeval now, const char *syscall, int err)
+    struct timeval now, const char *syscall, int err, const char *reason)
 {
   char *why = NULL;
 
@@ -1096,7 +1130,7 @@ void set_poison_state(w_root_t *root, struct watchman_dir *dir,
     syscall,
     dir->path->len,
     dir->path->buf,
-    strerror(err),
+    reason ? reason : strerror(err),
     syscall
   ));
 
@@ -1183,46 +1217,6 @@ static void crawler(w_root_t *root, w_string_t *dir_name,
   } while (w_ht_next(dir->files, &i));
 }
 
-static void process_subscriptions(w_root_t *root)
-{
-  w_ht_iter_t iter;
-
-  if (root->last_sub_tick == root->pending_sub_tick) {
-    return;
-  }
-
-  w_log(W_LOG_DBG, "sub last=%" PRIu32 "  pending=%" PRIu32 "\n",
-      root->last_sub_tick,
-      root->pending_sub_tick);
-
-  /* now look for subscribers */
-  w_log(W_LOG_DBG, "looking for connected subscribers\n");
-  pthread_mutex_lock(&w_client_lock);
-  if (w_ht_first(clients, &iter)) do {
-    struct watchman_client *client = w_ht_val_ptr(iter.value);
-    w_ht_iter_t citer;
-
-    w_log(W_LOG_DBG, "client=%p fd=%d\n", client, client->fd);
-
-    if (w_ht_first(client->subscriptions, &citer)) do {
-      struct watchman_client_subscription *sub = w_ht_val_ptr(citer.value);
-
-      w_log(W_LOG_DBG, "sub=%p %s\n", sub, sub->name->buf);
-      if (sub->root != root) {
-        w_log(W_LOG_DBG, "root doesn't match, skipping\n");
-        continue;
-      }
-
-      w_run_subscription_rules(client, sub, root);
-
-    } while (w_ht_next(client->subscriptions, &citer));
-
-  } while (w_ht_next(clients, &iter));
-  pthread_mutex_unlock(&w_client_lock);
-
-  root->last_sub_tick = root->pending_sub_tick;
-}
-
 static bool vcs_file_exists(w_root_t *root,
     const char *dname, const char *fname)
 {
@@ -1258,6 +1252,60 @@ static bool vcs_file_exists(w_root_t *root,
   return file->exists;
 }
 
+static bool is_vcs_op_in_progress(w_root_t *root) {
+  return vcs_file_exists(root, ".hg", "wlock") ||
+         vcs_file_exists(root, ".git", "index.lock");
+}
+
+static void process_subscriptions(w_root_t *root)
+{
+  w_ht_iter_t iter;
+
+  if (root->last_sub_tick == root->pending_sub_tick) {
+    return;
+  }
+
+  // If it looks like we're in a repo undergoing a rebase or
+  // other similar operation, we want to defer subscription
+  // notifications until things settle down
+  if (is_vcs_op_in_progress(root)) {
+    w_log(W_LOG_DBG, "deferring subscription notifications "
+        "until VCS operations complete\n");
+    return;
+  }
+
+  w_log(W_LOG_DBG, "sub last=%" PRIu32 "  pending=%" PRIu32 "\n",
+      root->last_sub_tick,
+      root->pending_sub_tick);
+
+  /* now look for subscribers */
+  w_log(W_LOG_DBG, "looking for connected subscribers\n");
+  pthread_mutex_lock(&w_client_lock);
+  if (w_ht_first(clients, &iter)) do {
+    struct watchman_client *client = w_ht_val_ptr(iter.value);
+    w_ht_iter_t citer;
+
+    w_log(W_LOG_DBG, "client=%p fd=%d\n", client, client->fd);
+
+    if (w_ht_first(client->subscriptions, &citer)) do {
+      struct watchman_client_subscription *sub = w_ht_val_ptr(citer.value);
+
+      w_log(W_LOG_DBG, "sub=%p %s\n", sub, sub->name->buf);
+      if (sub->root != root) {
+        w_log(W_LOG_DBG, "root doesn't match, skipping\n");
+        continue;
+      }
+
+      w_run_subscription_rules(client, sub, root);
+
+    } while (w_ht_next(client->subscriptions, &citer));
+
+  } while (w_ht_next(clients, &iter));
+  pthread_mutex_unlock(&w_client_lock);
+
+  root->last_sub_tick = root->pending_sub_tick;
+}
+
 /* process any pending triggers.
  * must be called with root locked
  */
@@ -1272,8 +1320,7 @@ static void process_triggers(w_root_t *root)
   // If it looks like we're in a repo undergoing a rebase or
   // other similar operation, we want to defer triggers until
   // things settle down
-  if (vcs_file_exists(root, ".hg", "wlock") ||
-      vcs_file_exists(root, ".git", "index.lock")) {
+  if (is_vcs_op_in_progress(root)) {
     w_log(W_LOG_DBG, "deferring triggers until VCS operations complete\n");
     return;
   }
@@ -1341,31 +1388,26 @@ static void free_file_node(struct watchman_file *file)
   free(file);
 }
 
-static void age_out_file(w_root_t *root, struct watchman_file *file);
-
-static void age_out_dir(w_root_t *root, struct watchman_dir *dir)
+static void record_aged_out_dir(w_root_t *root, w_ht_t *aged_dir_names,
+    struct watchman_dir *dir)
 {
   w_ht_iter_t i;
 
-  if (dir->files && w_ht_first(dir->files, &i)) do {
-    struct watchman_file *file = w_ht_val_ptr(i.value);
-
-    assert(!file->exists);
-    age_out_file(root, file);
-  } while (w_ht_next(dir->files, &i));
+  w_log(W_LOG_DBG, "age_out: remember dir %.*s\n",
+      dir->path->len, dir->path->buf);
+  w_ht_insert(aged_dir_names, w_ht_ptr_val(dir->path),
+        w_ht_ptr_val(dir), false);
 
   if (dir->dirs && w_ht_first(dir->dirs, &i)) do {
     struct watchman_dir *child = w_ht_val_ptr(i.value);
 
-    age_out_dir(root, child);
+    record_aged_out_dir(root, aged_dir_names, child);
+    w_ht_iter_del(dir->dirs, &i);
   } while (w_ht_next(dir->dirs, &i));
-
-  // This will implicitly call delete_dir() which will tear down
-  // the files and dirs hashes
-  w_ht_del(root->dirname_to_dir, w_ht_ptr_val(dir->path));
 }
 
-static void age_out_file(w_root_t *root, struct watchman_file *file)
+static void age_out_file(w_root_t *root, w_ht_t *aged_dir_names,
+    struct watchman_file *file)
 {
   struct watchman_dir *dir;
   w_string_t *full_name;
@@ -1383,12 +1425,27 @@ static void age_out_file(w_root_t *root, struct watchman_file *file)
     // Remove the entry from the containing file hash
     w_ht_del(file->parent->files, w_ht_ptr_val(file->name));
   }
+  if (file->parent->dirs) {
+    // Remove the entry from the containing dir hash
+    w_ht_del(file->parent->dirs, w_ht_ptr_val(full_name));
+  }
+  if (file->parent->lc_files) {
+    // Remove the entry from the containing lower case files hash,
+    // but only it it matches us (it may point to a different file
+    // node with a differently-cased name)
+    w_string_t *lc_name = w_string_dup_lower(file->name);
+    if (w_ht_get(file->parent->lc_files, w_ht_ptr_val(lc_name))
+        == w_ht_ptr_val(file)) {
+      w_ht_del(file->parent->lc_files, w_ht_ptr_val(lc_name));
+    }
+    w_string_delref(lc_name);
+  }
 
-  // resolve the dir of the same name and recursively clean its
-  // contents
+  // resolve the dir of the same name and mark it for later removal
+  // from our internal datastructures
   dir = w_root_resolve_dir(root, full_name, false);
   if (dir) {
-    age_out_dir(root, dir);
+    record_aged_out_dir(root, aged_dir_names, dir);
   }
 
   // And free it.  We don't need to stop watching it, because we already
@@ -1396,6 +1453,18 @@ static void age_out_file(w_root_t *root, struct watchman_file *file)
   free_file_node(file);
 
   w_string_delref(full_name);
+}
+
+static void age_out_dir(w_root_t *root, struct watchman_dir *dir)
+{
+  w_log(W_LOG_DBG, "age_out: ht_del dir %.*s\n",
+      dir->path->len, dir->path->buf);
+
+  assert(!dir->files || w_ht_size(dir->files) == 0);
+
+  // This will implicitly call delete_dir() which will tear down
+  // the files and dirs hashes
+  w_ht_del(root->dirname_to_dir, w_ht_ptr_val(dir->path));
 }
 
 // Find deleted nodes older than the gc_age setting.
@@ -1408,9 +1477,11 @@ void w_root_perform_age_out(w_root_t *root, int min_age)
   struct watchman_file *file, *tmp;
   time_t now;
   w_ht_iter_t i;
+  w_ht_t *aged_dir_names;
 
   time(&now);
   root->last_age_out_timestamp = now;
+  aged_dir_names = w_ht_new(2, &w_ht_string_funcs);
 
   file = root->latest_file;
   while (file) {
@@ -1419,24 +1490,26 @@ void w_root_perform_age_out(w_root_t *root, int min_age)
       continue;
     }
 
-    // We look backwards for the next iteration, as forwards may
-    // be a file node that will also be deleted by age_out_file()
-    // below because it is a child node of the the current value
-    // of file.
-    tmp = file->prev;
+    // Get the next file before we remove the current one
+    tmp = file->next;
 
     w_log(W_LOG_DBG, "age_out file=%.*s/%.*s\n",
         file->parent->path->len, file->parent->path->buf,
         file->name->len, file->name->buf);
 
-    age_out_file(root, file);
+    age_out_file(root, aged_dir_names, file);
 
-    if (tmp) {
-      file = tmp;
-    } else {
-      file = root->latest_file;
-    }
+    file = tmp;
   }
+
+  // For each dir that matched a pruned file node, delete from
+  // our internal structures
+  if (w_ht_first(aged_dir_names, &i)) do {
+    struct watchman_dir *dir = w_ht_val_ptr(i.value);
+
+    age_out_dir(root, dir);
+  } while (w_ht_next(aged_dir_names, &i));
+  w_ht_free(aged_dir_names);
 
   // Age out cursors too.
   if (w_ht_first(root->cursors, &i)) do {
@@ -1696,10 +1769,14 @@ void watchman_watcher_init(void) {
 
 #if HAVE_FSEVENTS
   watcher_ops = &fsevents_watcher;
+#elif defined(HAVE_PORT_CREATE)
+  // We prefer portfs if you have both portfs and inotify on the assumption
+  // that this is an Illumos based system with both and that the native
+  // mechanism will yield more correct behavior.
+  // https://github.com/facebook/watchman/issues/84
+  watcher_ops = &portfs_watcher;
 #elif defined(HAVE_INOTIFY_INIT)
   watcher_ops = &inotify_watcher;
-#elif defined(HAVE_PORT_CREATE)
-  watcher_ops = &portfs_watcher;
 #elif defined(HAVE_KQUEUE)
   watcher_ops = &kqueue_watcher;
 #else
@@ -1737,15 +1814,14 @@ static bool root_check_restrict(const char *watch_path)
 {
   json_t *root_restrict_files = NULL;
   uint32_t i;
+  bool enforcing;
 
-  root_restrict_files = cfg_get_json(NULL, "root_restrict_files");
+  root_restrict_files = cfg_compute_root_files(&enforcing);
   if (!root_restrict_files) {
     return true;
   }
-
-  if (!json_is_array(root_restrict_files)) {
-    w_log(W_LOG_ERR,
-          "resolve_root: global config root_restrict_files is not an array\n");
+  if (!enforcing) {
+    json_decref(root_restrict_files);
     return true;
   }
 
@@ -1754,12 +1830,6 @@ static bool root_check_restrict(const char *watch_path)
     const char *restrict_file = json_string_value(obj);
     char *restrict_path;
     int rv;
-
-    if (!restrict_file) {
-      w_log(W_LOG_ERR, "resolve_root: global config root_restrict_files "
-            "element %" PRIu32 " should be a string\n", i);
-      continue;
-    }
 
     ignore_result(asprintf(&restrict_path, "%s/%s", watch_path,
                            restrict_file));
@@ -1906,8 +1976,8 @@ static w_root_t *root_resolve(const char *filename, bool auto_watch,
 
   if (!root_check_restrict(watch_path)) {
     ignore_result(asprintf(errmsg,
-          "none of the files listed in global config root_restrict_files are "
-          "present"));
+          "none of the files listed in global config root_files are "
+          "present and enforce_root_files is set to true"));
     w_log(W_LOG_ERR, "resolve_root: %s\n", *errmsg);
     if (watch_path != filename) {
       free(watch_path);
@@ -2052,6 +2122,42 @@ bool w_root_stop_watch(w_root_t *root)
     w_state_save();
   }
   signal_root_threads(root);
+
+  return stopped;
+}
+
+json_t *w_root_stop_watch_all(void)
+{
+  uint32_t roots_count, i;
+  w_root_t **roots;
+  w_ht_iter_t iter;
+  json_t *stopped;
+
+  pthread_mutex_lock(&root_lock);
+  roots_count = w_ht_size(watched_roots);
+  roots = calloc(roots_count, sizeof(*roots));
+
+  i = 0;
+  if (w_ht_first(watched_roots, &iter)) do {
+    w_root_t *root = w_ht_val_ptr(iter.value);
+    w_root_addref(root);
+    roots[i++] = root;
+  } while (w_ht_next(watched_roots, &iter));
+
+  stopped = json_array();
+  for (i = 0; i < roots_count; i++) {
+    w_root_t *root = roots[i];
+    w_string_t *path = root->root_path;
+    if (w_ht_del(watched_roots, w_ht_ptr_val(path))) {
+      w_root_cancel(root);
+      json_array_append_new(stopped, json_string_binary(path->buf, path->len));
+    }
+    w_root_delref(root);
+  }
+  free(roots);
+  pthread_mutex_unlock(&root_lock);
+
+  w_state_save();
 
   return stopped;
 }

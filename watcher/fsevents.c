@@ -225,7 +225,11 @@ static void *fsevents_thread(void *arg)
   FSEventStreamScheduleWithRunLoop(fs_stream,
       CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
   if (!FSEventStreamStart(fs_stream)) {
-    root->failure_reason = w_string_new("FSEventStreamStart failed");
+    root->failure_reason = w_string_make_printf(
+        "FSEventStreamStart failed, look at your log file %s for "
+        "lines mentioning FSEvents and see "
+        "https://facebook.github.io/watchman/docs/troubleshooting.html#"
+        "fsevents for more information\n", log_name);
     goto done;
   }
 
@@ -477,7 +481,7 @@ static DIR *fsevents_root_start_watch_dir(watchman_global_watcher_t watcher,
 
   osdir = opendir_nofollow(path);
   if (!osdir) {
-    handle_open_errno(root, dir, now, "opendir", errno);
+    handle_open_errno(root, dir, now, "opendir", errno, NULL);
     return NULL;
   }
 

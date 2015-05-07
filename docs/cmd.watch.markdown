@@ -6,6 +6,9 @@ category: Commands
 permalink: docs/cmd/watch.html
 ---
 
+Deprecated starting in version 3.1.  We recommend that clients adopt
+the [watch-project](cmd/watch-project.html) command.
+
 Requests that the specified dir is watched for changes.
 Watchman will track all files and dirs rooted at the specified path.
 
@@ -33,7 +36,7 @@ already.  A newly watched directory is processed in a couple of stages:
    fashion
  * All newly observed files are considered changed
 
-Unless the `--no-state-save` server option was used to start the watchman
+Unless the `--no-save-state` server option was used to start the watchman
 service, watches and their associated triggers are saved and re-established
 across a process restart.
 

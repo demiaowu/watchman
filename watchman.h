@@ -477,6 +477,7 @@ bool w_reap_children(bool block);
 #define W_LOG_FATAL 3
 
 extern int log_level;
+extern char *log_name;
 void w_log(int level, const char *fmt, ...)
 #ifdef __GNUC__
   __attribute__((format(printf, 2, 3)))
@@ -505,6 +506,7 @@ w_string_t *w_string_basename(w_string_t *str);
 w_string_t *w_string_canon_path(w_string_t *str);
 w_string_t *w_string_path_cat(w_string_t *parent, w_string_t *rhs);
 bool w_string_startswith(w_string_t *str, w_string_t *prefix);
+bool w_string_startswith_caseless(w_string_t *str, w_string_t *prefix);
 w_string_t *w_string_shell_escape(const w_string_t *str);
 w_string_t *w_string_implode(json_t *arr, const char *delim);
 
@@ -523,6 +525,7 @@ void w_root_free_watched_roots(void);
 void w_root_schedule_recrawl(w_root_t *root, const char *why);
 bool w_root_cancel(w_root_t *root);
 bool w_root_stop_watch(w_root_t *root);
+json_t *w_root_stop_watch_all(void);
 void w_root_mark_deleted(w_root_t *root, struct watchman_dir *dir,
     struct timeval now, bool recursive);
 void w_root_reap(void);
@@ -597,9 +600,6 @@ void w_run_subscription_rules(
     struct watchman_client_subscription *sub,
     w_root_t *root);
 
-json_t *w_match_results_to_json(
-    uint32_t num_matches,
-    struct watchman_rule_match *matches);
 void w_match_results_free(uint32_t num_matches,
     struct watchman_rule_match *matches);
 
@@ -776,6 +776,7 @@ const char *cfg_get_string(w_root_t *root, const char *name,
     const char *defval);
 json_int_t cfg_get_int(w_root_t *root, const char *name,
     json_int_t defval);
+json_t *cfg_compute_root_files(bool *enforcing);
 
 #include "watchman_query.h"
 #include "watchman_cmd.h"
@@ -818,12 +819,14 @@ struct watchman_trigger_command *w_build_trigger_from_def(
   w_root_t *root, json_t *trig, char **errmsg);
 
 void set_poison_state(w_root_t *root, struct watchman_dir *dir,
-    struct timeval now, const char *syscall, int err);
+    struct timeval now, const char *syscall, int err,
+    const char *reason);
 
 void watchman_watcher_init(void);
 void watchman_watcher_dtor(void);
 void handle_open_errno(w_root_t *root, struct watchman_dir *dir,
-    struct timeval now, const char *syscall, int err);
+    struct timeval now, const char *syscall, int err,
+    const char *reason);
 void stop_watching_dir(w_root_t *root, struct watchman_dir *dir);
 DIR *opendir_nofollow(const char *path);
 
